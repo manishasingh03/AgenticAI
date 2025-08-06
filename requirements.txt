@@ -2,3 +2,12 @@ requests
 numpy
 pydantic
 dotenv
+weaviate-client
+openai
+python-dotenv
+pydantic-settings
+openai-agents
+backoff
+rich.progress
+progress
+langfuse
