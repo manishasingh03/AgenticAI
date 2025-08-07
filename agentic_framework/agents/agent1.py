@@ -1,17 +1,16 @@
-import asyncio
-import contextlib
-import signal
-import sys
-import uuid
-
-from agents import Agent, function_tool, OpenAIChatCompletionsModel
+from agents import Agent,Runner,OpenAIChatCompletionsModel,function_tool
+from openai import AsyncOpenAI
 from agentic_framework.tools.embeddings_cloudflare import get_embedding
 from agentic_framework.tools.gemini_llm import ask_gemini
 from agentic_framework.tools.weaviate_kb import fetch_similar_issues, close_client
 from agentic_framework.prompts import REACT_INSTRUCTIONS
-#from langfuse import Langfuse, Trace
 from pydantic import BaseModel
-from openai import AsyncOpenAI
+from dotenv import load_dotenv
+import os
+import asyncio
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+load_dotenv()
 
 
 class PlannerInput(BaseModel):
@@ -28,31 +27,15 @@ class PlannerOutput(BaseModel):
     status: str
 
 
-# langfuse = Langfuse()
-async_openai_client = AsyncOpenAI()
+# Read credentials
+open_ai_api_key = os.getenv("OPENAI_API_KEY")
+open_ai_base_url = os.getenv("OPENAI_API_BASE")
+# Create client to use Gemini
+gemini_client = AsyncOpenAI(base_url=open_ai_base_url,api_key=open_ai_api_key)
+gemini_model = OpenAIChatCompletionsModel(model='gemini-2.5-flash',openai_client=gemini_client)
 
-
-# Graceful shutdown handlers (keep as is)
-async def _cleanup_clients() -> None:
-    close_client()
-
-
-def _handle_sigint(signum: int, frame: object) -> None:
-    with contextlib.suppress(Exception):
-        asyncio.get_event_loop().run_until_complete(_cleanup_clients())
-    sys.exit(0)
-
-
-signal.signal(signal.SIGINT, _handle_sigint)
-
-
+@function_tool
 async def recommend_solutions(issue: PlannerInput) -> str:
-    # trace = Trace(
-    #     name="Agent1_Recommendation",
-    #     input=issue.model_dump(),
-    #     id=str(uuid.uuid4()),
-    # )
-    #trace.start()
     try:
         issue_dict = issue.model_dump()
         issue_id = issue_dict.get("issue_id", "unknown")
@@ -85,32 +68,19 @@ async def recommend_solutions(issue: PlannerInput) -> str:
             f"Issue ID: {i['issue_id']} | Type: {i['issue_type']}\nSuggested Remediation:\n{i['remediation_plan']}"
             for i in similar_issues
         ]
-
         result = "\n---\n".join(output)
-        #trace.set_output(result)
+        #print("Result: ",result)
         return result
 
     except Exception as e:
-        #trace.set_error(str(e))
         raise
 
-    finally:
-        #trace.end()
-        print("enmf")
-
-
-worker_agent = Agent(
-    name="IssueWorkerAgent",
+worker_agent = Agent(name="IssueWorkerAgent",
     instructions=(
         "Analyze a banking issue dictionary: summarize it, embed it, "
         "and find similar resolved issues to recommend solutions."
-    ),
-    tools=[recommend_solutions],
-    model=OpenAIChatCompletionsModel(
-        model="gemini-2.5-flash",
-        openai_client=async_openai_client
-    ),
-)
+    ),tools=[recommend_solutions],
+    model=gemini_model)
 
 planner_agent = Agent(
     name="IssuePlannerAgent",
@@ -118,22 +88,22 @@ planner_agent = Agent(
     tools=[
         worker_agent.as_tool(
             tool_name="analyze_issue",
-            tool_description="Analyze a banking issue dictionary and recommend remediation suggestions."
+            tool_description="Analyze a banking issue dictionary and recommend remediation suggestions. Give me in a single paragraph."
         )
     ],
-    model=OpenAIChatCompletionsModel(
-        model="gemini-2.5-flash",
-        openai_client=async_openai_client
-    ),
+    model=gemini_model,
 )
 
+async def main():
+    input_data = {
+        "issue_id":"12345",
+        "issue_type":"Login Failure",
+        "issue_description":"Customer is unable to log in using mobile banking app after the recent update.",
+        "resolution":"Customer was advised to reinstall the app and clear cache."}
+        # Convert dict to string prompt
+    issue_prompt = "\n".join(f"{k}: {v}" for k, v in input_data.items())
+    result = await Runner.run(planner_agent,input=issue_prompt)
+    print(result.final_output)
 
-@function_tool
-async def invoke_planner(input: PlannerInput) -> PlannerOutput:
-    remediation_text = await recommend_solutions(input)
-    return PlannerOutput(
-        issue_id=input.issue_id,
-        issue_type=input.issue_type,
-        remediation_plan=remediation_text,
-        status="Resolved"
-    )
+if __name__ == "__main__":
+    asyncio.run(main())       
