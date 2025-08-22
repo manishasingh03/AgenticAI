@@ -3,15 +3,38 @@ from openai import AsyncOpenAI
 from agentic_framework.tools.embeddings_cloudflare import get_embedding
 from agentic_framework.tools.gemini_llm import ask_gemini
 from agentic_framework.tools.weaviate_kb import fetch_similar_issues, close_client
-from agentic_framework.prompts import REACT_INSTRUCTIONS
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
 import asyncio
 import sys
+from typing import Optional
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 load_dotenv()
 
+#main variables
+RECOMMEND_SOLUTIONS_PROMPT = "recommend_solutions_prompt.j2"
+REACT_INSTRUCTIONS="react_instructions.j2"
+JUDGE_ANSWER_PROMPT="judge_answer_prompt.j2"
+WORKER_AGENT_INSTRUCTIONS="worker_agent_instructions.j2"
+
+# Set up the environment and loader at top level (ideally singleton/shared)
+_PROMPT_DIR = os.path.join(os.path.dirname(__file__), "prompts")
+env = Environment(
+    loader=FileSystemLoader(_PROMPT_DIR),
+    autoescape=select_autoescape(['j2'])
+)
+
+def load_prompt(name, **kwargs):
+    """
+    Render a Jinja2 prompt template.
+    :param name: template file name, e.g., 'planner_agent_instructions.j2'
+    :param kwargs: template context variables
+    """
+    template = env.get_template(name)
+    return template.render(**kwargs)
 
 class PlannerInput(BaseModel):
     issue_id: str
@@ -26,6 +49,15 @@ class PlannerOutput(BaseModel):
     remediation_plan: str
     status: str
 
+class JudgeInput(BaseModel):
+    issue: dict  # Or PlannerInput type for stricter typing
+    other_input: Optional[dict]
+    task_description: str
+    model_output: str
+
+class JudgeOutput(BaseModel):
+    is_correct: bool
+    feedback: str
 
 # Read credentials
 open_ai_api_key = os.getenv("OPENAI_API_KEY")
@@ -47,12 +79,7 @@ async def recommend_solutions(issue: PlannerInput) -> str:
 
         # Summarize with Gemini
         # Note: Span management removed since your Langfuse version might not support it
-        prompt = f"""
-            Summarize the following banking issue into a single, dense paragraph.
-            Focus on the core problem, its root cause, and the actions taken for the final resolution.
-            ISSUE DATA:
-            {combined_info}
-        """
+        prompt = load_prompt(RECOMMEND_SOLUTIONS_PROMPT, combined_info=combined_info)
         summary = ask_gemini(prompt)
 
         # Embed
@@ -75,20 +102,53 @@ async def recommend_solutions(issue: PlannerInput) -> str:
     except Exception as e:
         raise
 
+@function_tool
+async def judge_answer(inputs: JudgeInput) -> JudgeOutput:
+    prompt = load_prompt(
+                    "judge_answer_prompt.j2",
+                    task_description=inputs.task_description,
+                    issue=inputs.issue,
+                    other_input=inputs.other_input,
+                    model_output=inputs.model_output)
+
+    llm_response = await ask_gemini(prompt) 
+    # Parse response
+    lines = llm_response.strip().split('\n')
+    correct_flag = None
+    feedback = ""
+    for line in lines:
+        if line.lower().startswith("correct:"):
+            correct_flag = line.split(':', 1)[1].strip().upper() == "YES"
+        if line.lower().startswith("feedback:"):
+            feedback = line.split(':', 1).strip()
+    if correct_flag is None:
+        correct_flag = False
+        feedback = "LLM did not format answer properly."
+    return JudgeOutput(is_correct=correct_flag, feedback=feedback)
+
+judge_agent = Agent(
+    name="JudgeAgent",
+    instructions="You evaluate if a given model output, based on task, is correct for the input issue.",
+    tools=[judge_answer],
+    model=gemini_model
+)
+
 worker_agent = Agent(name="IssueWorkerAgent",
-    instructions=(
-        "Analyze a banking issue dictionary: summarize it, embed it, "
-        "and find similar resolved issues to recommend solutions."
-    ),tools=[recommend_solutions],
+    instructions=load_prompt(WORKER_AGENT_INSTRUCTIONS),
+    tools=[recommend_solutions],
     model=gemini_model)
 
 planner_agent = Agent(
     name="IssuePlannerAgent",
-    instructions=REACT_INSTRUCTIONS,
+    instructions=load_prompt(REACT_INSTRUCTIONS),
     tools=[
         worker_agent.as_tool(
             tool_name="analyze_issue",
             tool_description="Analyze a banking issue dictionary and recommend remediation suggestions. Give me in a single paragraph."
+        ),
+        judge_agent.as_tool(
+            tool_name="judge_solution",
+            tool_description="Evaluate if the answer given by an agent is correct for a given issue and task."
         )
     ],
     model=gemini_model,
