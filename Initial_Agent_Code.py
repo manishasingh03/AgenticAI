@@ -11,7 +11,7 @@ from email.mime.text import MIMEText
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 
 load_dotenv()
 
